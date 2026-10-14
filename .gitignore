@@ -1,0 +1,12 @@
+.data/
+.DS_Store
+node_modules/
+*.log
+*.app/
+*.zip
+*.dmg
+.planbridge-build/
+server-*.json
+.env
+.env.*
+!.env.example

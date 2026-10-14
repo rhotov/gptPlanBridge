@@ -1,0 +1,104 @@
+name: Release macOS app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - package.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: planbridge-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (!/^\d+\.\d+\.\d+$/.test(version)) throw Error('Release version must be a stable semantic version.');
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\ntag=v${version}\n`);
+          JS
+      - name: Check whether this version is already published
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const url = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${encodeURIComponent(process.env.RELEASE_TAG)}`;
+          const response = await fetch(url, {
+            headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+            redirect: 'error', signal: AbortSignal.timeout(15000),
+          });
+          if (![200, 404].includes(response.status)) throw Error(`Release lookup failed (HTTP ${response.status}).`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `exists=${response.status === 200}\n`);
+          console.log(response.status === 200 ? 'This version is already published; existing assets will be kept.' : 'This version has not been published.');
+          JS
+      - name: Test
+        if: steps.existing.outputs.exists == 'false'
+        run: npm test
+      - name: Build public app
+        if: steps.existing.outputs.exists == 'false'
+        shell: bash
+        run: |
+          env -u PLANBRIDGE_LEGACY_DATA_DIR PLANBRIDGE_NODE_BIN="$(command -v node)" ./macos/build-app.command
+      - name: Verify archive, signature and checksum
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, plistlib, zipfile
+          from pathlib import Path, PurePosixPath
+          archive = Path(os.environ['GITHUB_WORKSPACE']).parent / 'PlanBridge-macOS-arm64.zip'
+          with zipfile.ZipFile(archive) as bundle:
+              names = bundle.namelist()
+              forbidden = {'.data', '.git', 'node_modules', '.env', 'state.json', 'storage-location.json'}
+              assert all(not forbidden.intersection(PurePosixPath(name).parts) and not name.endswith('.log') for name in names), 'Archive contains private or generated data.'
+              assert json.loads(bundle.read('PlanBridge.app/Contents/Resources/installation.json')) == {}, 'Public archive must not embed a migration path.'
+              info = plistlib.loads(bundle.read('PlanBridge.app/Contents/Info.plist'))
+              assert info['CFBundleShortVersionString'] == os.environ['RELEASE_VERSION'], 'App version and package.json must match.'
+          PY
+          PLANBRIDGE_VERIFY_DIR="$(mktemp -d "$RUNNER_TEMP/planbridge-verify.XXXXXX")"
+          trap 'rm -rf "$PLANBRIDGE_VERIFY_DIR"' EXIT
+          /usr/bin/ditto -x -k "$GITHUB_WORKSPACE/../PlanBridge-macOS-arm64.zip" "$PLANBRIDGE_VERIFY_DIR"
+          /usr/bin/codesign --verify --deep --strict "$PLANBRIDGE_VERIFY_DIR/PlanBridge.app"
+          cd "$GITHUB_WORKSPACE/.."
+          /usr/bin/shasum -a 256 PlanBridge-macOS-arm64.zip > PlanBridge-macOS-arm64.zip.sha256
+          /usr/bin/shasum -a 256 -c PlanBridge-macOS-arm64.zip.sha256
+      - name: Publish release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "PlanBridge $RELEASE_VERSION" \
+            --notes-file macos/RELEASE-NOTES.md \
+            "$GITHUB_WORKSPACE/../PlanBridge-macOS-arm64.zip" \
+            "$GITHUB_WORKSPACE/../PlanBridge-macOS-arm64.zip.sha256"
